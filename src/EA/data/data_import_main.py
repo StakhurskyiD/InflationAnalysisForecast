@@ -12,7 +12,7 @@ data_import_main.py
 
 import pandas as pd
 
-from src.EA.data.features.quarter_fe_pipeline import add_features_to_quarterly_data
+from src.EA.data.features.quarter_fe_pipeline import build_features
 from src.EA.data.helpers.convert_monthly_data_to_quarterly import convert_data_from_monthly_to_quarterly_range
 from src.EA.data.helpers.merge_transformed_quarterly_data import merge_quarterly_data
 from src.EA.data.imports.fetch_import_data import fetch_and_save_research_data
@@ -60,13 +60,15 @@ def import_and_preprocess_research_data():
     місячних, квартальних та річних даних.
     """
     # ============= 1. ЗАВАНТАЖЕННЯ МІСЯЧНИХ ДАНИХ =============
-    # fetch_and_save_research_data()
+    fetch_and_save_research_data()
 
     preprocess_monthly_data()
     preprocess_quarterly_data()
     convert_data_from_monthly_to_quarterly_range()
     merge_quarterly_data()
-    add_features_to_quarterly_data()
+    build_features()
+
+
     # monthly_data_path = "../../data/import_data/monthly_data.csv"
     # monthly_df = load_and_map_monthly_data(monthly_data_path)
     # print("=== МІСЯЧНІ ДАНІ ===")

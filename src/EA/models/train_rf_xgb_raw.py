@@ -1,107 +1,197 @@
-"""
-RAW  →  prep.pkl  →  RF + XGB
------------------------------------------
-• читає макро‑фічі без попередньої обробки
-• підключає ColumnTransformer (імпутер+OHE+скейл)
-• проводить 5‑фолд TimeSeries CV
-• фітить RandomForest та XGBoost на full‑train
-• зберігає *.pkl  і  feature‑importance
-"""
-import json, joblib, numpy as np, pandas as pd
+# src/pipelines/train_models_from_prep.py
+# -----------------------------------------------------------
+from __future__ import annotations
+import json, logging
 from pathlib import Path
+from typing import Literal, Sequence, Union
+import inspect
+
+import joblib, numpy as np, pandas as pd
 from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_absolute_error
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.pipeline import Pipeline
 from sklearn.ensemble import RandomForestRegressor
-from xgboost import XGBRegressor
+from xgboost import XGBRegressor, callback
 
-# ------------------------ CONFIG ------------------------------------------
-RAW_FILE   = Path('processed_quarter_features.csv')
-PREP_FILE  = Path('prep.pkl')        # уже навчений ColumnTransformer
-TARGET     = "inflation_index_t+1"
-DROP       = ["date", "quarter_period"]            # raw‑колонки, що не потрібні
-TEST_FRAC  = 0.20                                  # останні 20 % → hold‑out
-N_SPLITS   = 5                                     # CV усередині train
-MODEL_DIR  = Path("models")
-MODEL_DIR.mkdir(exist_ok=True)
+try:
+    from tqdm.auto import tqdm
+except ImportError:                   # fallback, якщо tqdm не встановлений
+    def tqdm(it, **kw): return it      # type: ignore
 
-# ------------------------ 0. LOAD RAW -------------------------------------
-df = pd.read_csv(RAW_FILE, parse_dates=["date_q"], index_col="date_q")
-X = df.drop(columns=[TARGET] + DROP)
-y = df[TARGET]
 
-# ------------------------ 1. LOAD PREPROCESSOR ----------------------------
-prep: ColumnTransformer = joblib.load(PREP_FILE)
-print("✓ prep.pkl завантажено — типи трансформерів:",
-      [name for name, _, _ in prep.transformers])
+def _es_callback(rounds: int = 50):
+    """Колбек «рання зупинка» сумісний із XGBoost ≥ 2.0."""
+    return callback.EarlyStopping(rounds=rounds, save_best=True)
 
-# ------------------------ 2. TIME SPLIT -----------------------------------
-test_size = int(np.ceil(len(df) * TEST_FRAC))
-X_train, X_test = X.iloc[:-test_size], X.iloc[-test_size:]
-y_train, y_test = y.iloc[:-test_size], y.iloc[-test_size:]
 
-# ------------------------ 3. МОДЕЛІ ---------------------------------------
-models = {
-    "RF": RandomForestRegressor(
-            n_estimators=600, max_depth=None,
-            max_features="sqrt", min_samples_leaf=10,
-            n_jobs=-1, random_state=42),
-    "XGB": XGBRegressor(
-            n_estimators=900, learning_rate=0.03,
-            max_depth=6, subsample=0.8, colsample_bytree=0.8,
-            reg_alpha=1.5, reg_lambda=1.0,
-            objective="reg:squarederror",
-            n_jobs=-1, random_state=42)
-}
+# ─────────────────────────────────────────────────────────────
+def train_models_from_prep(
+    raw_csv: Union[str, Path],
+    prep_file: Union[str, Path],
+    *,
+    target_col: str,
+    drop_cols: Sequence[str],
+    out_dir: Union[str, Path] = "models",
+    test_frac: float = 0.20,
+    n_splits: int = 3,
+    cv_mode: Literal["ts", "expanding"] = "expanding",
+    eval_frac: float = 0.50,               # високий %, щоб завжди ≥1 рядок
+    rf_params: dict | None = None,
+    xgb_params: dict | None = None,
+    random_state: int = 42,
+    logger: logging.Logger | None = None,
+) -> None:
+    log = logger or logging.getLogger(__name__)
+    raw_csv, prep_file, out_dir = Path(raw_csv), Path(prep_file), Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-tscv = TimeSeriesSplit(n_splits=N_SPLITS)
-cv_mae = {}
+    # 0. DATA & PREP --------------------------------------------------------
+    df = pd.read_csv(raw_csv, parse_dates=["date_q"], index_col="date_q")
+    X_raw = df.drop(columns=[target_col, *drop_cols])
+    y = df[target_col]
 
-for name, est in models.items():
-    pipe = Pipeline([("prep", prep), ("model", est)])
+    prep: ColumnTransformer = joblib.load(prep_file)
+    log.info("✓  prep.pkl завантажено (%d transformers)", len(prep.transformers))
 
-    # ---- CV inside train --------------------------------------------------
-    fold_mae = []
-    for k, (tr_idx, val_idx) in enumerate(tscv.split(X_train)):
-        pipe.fit(X_train.iloc[tr_idx], y_train.iloc[tr_idx])
-        pred = pipe.predict(X_train.iloc[val_idx])
-        mae  = mean_absolute_error(y_train.iloc[val_idx], pred)
-        fold_mae.append(mae)
-        print(f"{name} fold {k+1}/{N_SPLITS}   MAE = {mae: .3f}")
-    cv_mae[name] = float(np.mean(fold_mae))
-    print(f"{name} mean CV‑MAE: {cv_mae[name]: .3f}")
+    # 1. HOLD-OUT -----------------------------------------------------------
+    test_size = max(1, int(np.ceil(len(df) * test_frac)))
+    X_train, X_test = X_raw.iloc[:-test_size], X_raw.iloc[-test_size:]
+    y_train, y_test = y.iloc[:-test_size], y.iloc[-test_size:]
 
-    # ---- fit on full train + save ----------------------------------------
-    pipe.fit(X_train, y_train)
-    joblib.dump(pipe, MODEL_DIR / f"{name.lower()}_model.pkl")
+    # 2. MODELS -------------------------------------------------------------
+    rf_defaults = dict(
+        n_estimators=600, max_depth=None, max_features="sqrt",
+        min_samples_leaf=10, n_jobs=-1, random_state=random_state
+    )
+    xgb_defaults = dict(
+        n_estimators=2_000, learning_rate=0.03, max_depth=6,
+        subsample=0.8, colsample_bytree=0.8,
+        reg_alpha=1.5, reg_lambda=1.0,
+        objective="reg:squarederror",
+        n_jobs=-1, random_state=random_state
+    )
+    models = {
+        "RF": RandomForestRegressor(**(rf_params or rf_defaults)),
+        "XGB": XGBRegressor(**(xgb_params or xgb_defaults)),
+    }
 
-    # ---- feature importance ---------------------------------------------
-    if name == "RF":
-        imp = pipe.named_steps["model"].feature_importances_
-    else:
-        booster  = pipe.named_steps["model"].get_booster()
-        fmap     = pipe.named_steps["prep"].get_feature_names_out()
-        imp_dict = booster.get_score(importance_type="gain")
-        imp      = np.array([imp_dict.get(f, 0.0) for f in fmap])
+    # 3. CV SPLITS ----------------------------------------------------------
+    if cv_mode == "ts":
+        splits = list(TimeSeriesSplit(n_splits=n_splits).split(X_train))
+    else:  # expanding
+        horizon = max(1, len(X_train) // (n_splits + 1))
+        splits = [
+            (np.arange(0, k * horizon),
+             np.arange(k * horizon, min(len(X_train), (k + 1) * horizon)))
+            for k in range(1, n_splits + 1)
+        ]
 
-    pd.Series(imp,
-              index=pipe.named_steps["prep"].get_feature_names_out())\
-      .sort_values(ascending=False)\
-      .to_csv(MODEL_DIR / f"{name.lower()}_feat_imp.csv")
+    metrics = {"cv_mae": {}, "test_mae": {}}
 
-# ------------------------ 4. HOLD‑OUT METRIC ------------------------------
-pipe_rf  = joblib.load(MODEL_DIR / "rf_model.pkl")
-pipe_xgb = joblib.load(MODEL_DIR / "xgb_model.pkl")
-mae_test = {
-    "RF":  mean_absolute_error(y_test,  pipe_rf.predict(X_test)),
-    "XGB": mean_absolute_error(y_test, pipe_xgb.predict(X_test))
-}
+    for name, est in models.items():
+        pipe = Pipeline([("prep", prep), ("model", est)])
+        fold_mae: list[float] = []
 
-# ------------------------ 5. SAVE METRICS ---------------------------------
-with open(MODEL_DIR / "cv_mae.json", "w") as fp:
-    json.dump({"cv_mae": cv_mae, "test_mae": mae_test}, fp, indent=2)
+        for k, (tr_idx, val_idx) in enumerate(tqdm(splits, desc=name), 1):
+            X_tr, y_tr = X_train.iloc[tr_idx], y_train.iloc[tr_idx]
+            X_val, y_val = X_train.iloc[val_idx], y_train.iloc[val_idx]
 
-print("\n✓ Training complete.  Models & metrics збережено:")
-print("  CV MAE :", cv_mae)
-print("  Test MAE:", mae_test)
+            if name == "XGB":
+                eval_size = max(1, int(len(X_tr) * eval_frac))
+                if eval_size < len(X_tr):
+                    X_tr_es, y_tr_es = X_tr.iloc[:-eval_size], y_tr.iloc[:-eval_size]
+                    X_eval, y_eval = X_tr.iloc[-eval_size:], y_tr.iloc[-eval_size:]
+                    _fit_xgb(pipe, X_tr_es, y_tr_es, X_eval, y_eval, rounds=50)
+                else:
+                    _fit_xgb(pipe, X_tr, y_tr, rounds=50)  # замало рядків → без eval_set
+            else:
+                pipe.fit(X_tr, y_tr)
+
+            fold_mae.append(mean_absolute_error(y_val, pipe.predict(X_val)))
+            log.info("%s  fold %d/%d  MAE=%.3f", name, k, n_splits, fold_mae[-1])
+
+        metrics["cv_mae"][name] = float(np.mean(fold_mae))
+        log.info("%s  mean CV-MAE: %.3f", name, metrics["cv_mae"][name])
+
+        # 4. TRAIN ON FULL ---------------------------------------------------
+        pipe.fit(X_train, y_train)
+        joblib.dump(pipe, out_dir / f"{name.lower()}_model.pkl")
+
+        y_pred_test = pipe.predict(X_test)
+        metrics["test_mae"][name] = mean_absolute_error(y_test, y_pred_test)
+        pd.Series(y_pred_test, index=X_test.index, name="y_pred") \
+          .to_csv(out_dir / f"{name.lower()}_y_test_pred.csv")
+
+        # 5. FEATURE IMPORTANCE ---------------------------------------------
+        if name == "RF":
+            imp = xgb_gain_importance(pipe[-1], pipe[0].get_feature_names_out())
+        else:
+            fmap = pipe[-1].get_booster().get_score(importance_type="gain")
+            imp = np.array([fmap.get(f, 0.0) for f in pipe[0].get_feature_names_out()])
+        pd.Series(imp, index=pipe[0].get_feature_names_out()) \
+          .sort_values(ascending=False) \
+          .to_csv(out_dir / f"{name.lower()}_feat_imp.csv")
+
+        if "XGB" in name:
+            _fit_xgb(pipe, X_train, y_train, rounds=50)  # без eval-set
+        else:
+            pipe.fit(X_train, y_train)
+
+    # 6. SAVE METRICS -------------------------------------------------------
+    with open(out_dir / "metrics.json", "w") as fh:
+        json.dump(metrics, fh, indent=2)
+    log.info("🏁  Готово.  Metрики: %s", metrics)
+
+
+# ─────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    train_models_from_prep(
+        raw_csv="src/research_data/processed_data/quarterly_data_with_features.csv",
+        prep_file="src/research_data/processed_data/prep.pkl",
+        target_col="inflation_index_t+1",
+        drop_cols=["date", "quarter_period"],
+        out_dir="models",
+        n_splits=3,
+        cv_mode="expanding",
+        eval_frac=0.5,
+    )
+
+
+def _has_param(func, name: str) -> bool:
+    """Перевіряє, чи ф-ція/метод приймає параметр."""
+    return name in inspect.signature(func).parameters
+
+
+def _fit_xgb(pipe: Pipeline,
+             X_tr, y_tr,
+             X_eval=None, y_eval=None,
+             rounds: int = 50) -> None:
+    """Сумісний fit з ранньою зупинкою для всіх версій XGBoost."""
+    fit_params = {}
+    est_fit = pipe[-1].fit
+
+    if X_eval is not None and y_eval is not None:
+        # 1) Нова схема (callbacks)
+        if _has_param(est_fit, "callbacks"):
+            fit_params["callbacks"] = [callback.EarlyStopping(rounds=rounds, save_best=True)]
+            fit_params["eval_set"] = [(X_eval, y_eval)]
+
+        # 2) Стара схема (early_stopping_rounds)
+        elif _has_param(est_fit, "early_stopping_rounds"):
+            fit_params["early_stopping_rounds"] = rounds
+            fit_params["eval_set"] = [(X_eval, y_eval)]
+
+        # 3) Жоден із параметрів не підтримується  → без ES
+    pipe.fit(X_tr, y_tr, **fit_params)
+
+
+def xgb_gain_importance(est, feature_names):
+    # витягаємо map fX → ім'я
+    fmap = dict(zip(est.feature_names_in_, feature_names))
+    raw = est.get_booster().get_score(importance_type="gain")
+    return np.array([raw.get(k, 0.0) for k in est.feature_names_in_])

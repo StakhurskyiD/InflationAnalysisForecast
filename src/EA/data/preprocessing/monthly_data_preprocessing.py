@@ -183,7 +183,7 @@ def preprocess_monthly_data():
     out_dir = project_root / "research_data" / "import_data"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    monthly_data_path: Path = out_dir / "monthly_data.csv"
+    monthly_data_path: Path = out_dir / "imported_monthly_data.csv"
     df_monthly = load_and_map_monthly_data(monthly_data_path)
 
     # Якщо немає колонки 'year_month', створимо її на основі 'year'

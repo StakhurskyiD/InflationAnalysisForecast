@@ -1,92 +1,127 @@
-import pandas as pd
-import numpy as np
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+build_quarterly_features.py
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Створює розширений датасет `quarterly_data_with_features.csv`
+із вихідного `quarterly_data.csv`.
+
+• auto-clean column names                           • вилучає службові колонки
+• lags / QoQ / YoY / rolling stats (усі числові)    • сезонні sin/cos та dummy-рік
+• мінімізована втрата спостережень (rolling min_periods, flex ROW_THRESH)
+"""
+from __future__ import annotations
+import re, unicodedata
 from pathlib import Path
 
-###############################################################################
-# 0. CONFIG
-###############################################################################
-project_root = Path(__file__).resolve().parent.parent.parent.parent
+import numpy as np
+import pandas as pd
 
-quarterly_input_dir = project_root / "research_data" / "processed_data"
-quarterly_input_dir.mkdir(parents=True, exist_ok=True)
-quarterly_data_path: Path = quarterly_input_dir / "quarterly_data.csv"
+# ────────────────────────────── CONFIG ─────────────────────────────────── #
+ROOT       = Path(__file__).resolve().parent.parent.parent.parent
+RAW_CSV    = ROOT / "research_data" / "processed_data" / "quarterly_data.csv"
+OUT_CSV    = ROOT / "research_data" / "processed_data" / "quarterly_data_with_features.csv"
 
-quarterly_data_with_features_path: Path = quarterly_input_dir / "quarterly_data_with_features.csv"
+TARGET     = "inflation_index"   # оригінальна колонка-ціль
+HORIZON    = 1                   # квартал наперед
+LAGS       = (1, 2, 4)           # 1q, 2q, 1y
+ROLL_WINS  = (4, 8)              # ≈ 1 рік та 2 роки
+ROW_THRESH = 0.50               # мін. частка non-NaN у рядку після генерації
 
-RAW_FILE = quarterly_data_path          # ваш CSV
-OUT_FILE = quarterly_data_with_features_path
-TARGET_COL = "inflation_index"
-HORIZON = 1    # квартал наперед
-
-# стовпці‑кандидати
-LAG_COLS  = ["inflation_index", "core_inflation_index",
-             "cpi_index", "total_gdp_deflator",
-             "avg_wage_uah", "ppi_index"]           # + exchange_rate, якщо є
-DIFF_COLS = ["total_gdp_deflator", "nominal_gdp_index",
-             "avg_wage_uah", "ppi_index"]
+# ───────────────────────── helper-функції ──────────────────────────────── #
+def _snake(s: str) -> str:
+    """Перевести в snake_case + прибрати небажані символи (укр/лат)."""
+    s = unicodedata.normalize("NFKD", s)
+    s = re.sub(r"[^\w\s]", "", s, flags=re.U)
+    s = re.sub(r"\s+", "_", s.strip(), flags=re.U)
+    return s.lower()
 
 
-def add_features_to_quarterly_data():
-    ###############################################################################
-    # 1. LOAD & BASIC CLEAN
-    ###############################################################################
-    df = (pd.read_csv(RAW_FILE)
-            .replace(",", ".", regex=True)
-            .apply(lambda s: s.str.replace(" ", "") if s.dtype == "object" else s)
-    )                       # прибираємо пробіли у числах '11,2'
+def _make_time_index(df: pd.DataFrame) -> pd.DataFrame:
+    """quarter_period → DatetimeIndex (1-й день кварталу)"""
+    idx = pd.PeriodIndex(df["quarter_period"], freq="Q").to_timestamp()
+    df = df.set_index(idx).sort_index()
+    df.index.name = "date_q"
+    return df
+
+
+# ────────────────────────────── PIPELINE ───────────────────────────────── #
+def build_features() -> None:
+    if not RAW_CSV.exists():
+        raise FileNotFoundError(RAW_CSV)
+
+    # ---------- 1. LOAD & BASIC CLEAN ------------------------------------ #
+    df = pd.read_csv(RAW_CSV, dtype=str)
+
+    # прибираємо службові / debug-колонки (наприклад, _merge)
+    df = df.loc[:, ~df.columns.str.contains(r"_merge$", case=False)]
+
+    # стандартизуємо назви колонок
+    df.columns = [_snake(c) for c in df.columns]
+
+    # to numeric
     num_cols = df.columns.difference(["quarter_period", "date"])
-    df[num_cols] = df[num_cols].apply(pd.to_numeric, errors="coerce")
+    df[num_cols] = (df[num_cols]
+                    .apply(lambda s: s.str.replace(",", ".", regex=False))
+                    .apply(lambda s: s.str.replace(r"[^\d\.\-]", "", regex=True))
+                    .apply(pd.to_numeric, errors="coerce"))
 
-    # перетворимо quarter_period -> DatetimeIndex (перший місяць кварталу)
-    df["date_q"] = pd.PeriodIndex(df["quarter_period"], freq="Q").to_timestamp()
-    df = df.set_index("date_q").sort_index()
+    df = _make_time_index(df)
+    start_rows = len(df)
 
-    ###############################################################################
-    # 2. TARGET
-    ###############################################################################
-    df[f"{TARGET_COL}_t+{HORIZON}"] = df[TARGET_COL].shift(-HORIZON)
+    # ---------- 2. TARGET ------------------------------------------------- #
+    df[f"{TARGET}_t+{HORIZON}"] = df[TARGET].shift(-HORIZON)
 
-    ###############################################################################
-    # 3. LAG FEATURES
-    ###############################################################################
-    for col in LAG_COLS:
-        for lag in [1, 2, 4]:                   # 1‑, 2‑, 4‑квартальні зсуви
-            df[f"{col}_lag{lag}"] = df[col].shift(lag)
+    # ---------- 3. DATE / SEASONAL FEATS --------------------------------- #
+    df["quarter"] = df.index.quarter
+    df["year"]    = df.index.year
+    df["sin_q"]   = np.sin(2 * np.pi * df.quarter / 4)
+    df["cos_q"]   = np.cos(2 * np.pi * df.quarter / 4)
 
-    ###############################################################################
-    # 4. Δ / GROWTH FEATURES
-    ###############################################################################
-    for col in DIFF_COLS:
-        df[f"{col}_qoq"] = df[col].pct_change()             # квартал‑до‑кварталу
-        df[f"{col}_yoy"] = df[col].pct_change(4)            # рік‑до‑року
-        df[f"{col}_diff"] = df[col].diff()                  # абсолютна різниця
+    # перелік числових колонок для генерації ознак
+    base_num = df.select_dtypes("number").columns.difference([f"{TARGET}_t+{HORIZON}"])
 
-    ###############################################################################
-    # 5. ROLLING STATS  (4‑кв. вікно)
-    ###############################################################################
-    for col in ["inflation_index", "ppi_index", "avg_wage_uah"]:
-        df[f"{col}_mean4"] = df[col].rolling(4).mean()
-        df[f"{col}_std4"]  = df[col].rolling(4).std()
+    # ---------- 4. LAGS, QoQ, YoY ---------------------------------------- #
+    for lag in LAGS:
+        df[[f"{c}_lag{lag}" for c in base_num]] = df[base_num].shift(lag)
 
-    ###############################################################################
-    # 6. COMPOSITE INDICES
-    ###############################################################################
-    df["real_wage_index"] = df["avg_wage_uah"] / df["cpi_index"]
-    df["gdp_gap"]         = df["nominal_gdp_index"] / df["real_gdp_index"] - 1
-    df["inflation_gap"]   = df["inflation_index"] - df["core_inflation_index"]
+    df[[f"{c}_qoq" for c in base_num]] = df[base_num].pct_change().fillna(0)
+    df[[f"{c}_yoy" for c in base_num]] = df[base_num].pct_change(4).fillna(0)
 
-    ###############################################################################
-    # 7. INTERACTION EXAMPLE
-    ###############################################################################
-    df["ppi_infl_gap_interact"] = df["ppi_index_qoq"] * df["inflation_gap"]
+    # ---------- 5. ROLLING STATS ----------------------------------------- #
+    for w in ROLL_WINS:
+        m = (df[base_num]
+             .rolling(window=w, min_periods=1)
+             .mean()
+             .add_suffix(f"_mean{w}"))
+        s = (df[base_num]
+             .rolling(window=w, min_periods=2)   # std вимагає ≥2
+             .std()
+             .add_suffix(f"_std{w}"))
+        df = pd.concat([df, m, s], axis=1)
 
-    ###############################################################################
-    # 8. FINAL CLEAN & SAVE
-    ###############################################################################
-    # викидаємо рядки без таргету, заповнюємо решту
-    df = df.dropna(subset=[f"{TARGET_COL}_t+{HORIZON}"])
-    df = df.fillna(method="ffill").dropna()
+    # ---------- 6. INTERACTIONS (приклад) -------------------------------- #
+    if {"ppi_index_qoq", "inflation_index_qoq"} <= set(df.columns):
+        df["ppi_inf_qoq_inter"] = df["ppi_index_qoq"] * df["inflation_index_qoq"]
 
-    # зберігаємо
-    df.to_csv(OUT_FILE, index=True)
-    print(f"✓  Feature file saved to {OUT_FILE.resolve()}  (shape = {df.shape})")
+    # ---------- 7. CLEAN & SAVE ------------------------------------------ #
+    # прибираємо останній квартал без таргету та занадто «порожні» рядки
+    df = df.dropna(subset=[f"{TARGET}_t+{HORIZON}"])
+    min_non_null = int(ROW_THRESH * df.shape[1])
+    df = (df
+          .dropna(axis=0, thresh=min_non_null)
+          .ffill()
+          .dropna())
+
+    kept_rows = len(df)
+    print(f"Rows kept after feature gen: {kept_rows}/{start_rows}  "
+          f"(-{100*(start_rows-kept_rows)/start_rows:.0f} %)")
+
+    OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(OUT_CSV, index=True)
+    print(f"✓ Feature file saved → {OUT_CSV.resolve()}  (shape = {df.shape})")
+
+
+# ───────────────────────────────────────────────────────────────────────── #
+if __name__ == "__main__":
+    build_features()
