@@ -66,7 +66,7 @@ def import_and_preprocess_research_data():
     preprocess_quarterly_data()
     convert_data_from_monthly_to_quarterly_range()
     merge_quarterly_data()
-    build_features()
+    # build_features()
 
 
     # monthly_data_path = "../../data/import_data/monthly_data.csv"

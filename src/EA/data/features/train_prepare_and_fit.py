@@ -1,314 +1,240 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-prepare_tree.py – end-to-end pipeline (winsorize + RF/XGB + SHAP)
-Author: <your-name>
-"""
+prepare_tree_data_for_xgb.py
+────────────────────────────
+End-to-end pipeline: clean → winsorize → train RF & XGB → SHAP →
+метрики → зберігає всі артефакти у вибраний каталог.
 
+Артефакти
+---------
+dataset_ready/
+    X_train_raw.csv  X_test_raw.csv  y_train.csv  y_test.csv
+rf_model.pkl   xgb_model.pkl
+rf_feat_imp.csv  xgb_feat_imp.csv
+prep.pkl                 ← 💡 тепер обов’язково зберігається
+xgb_shap_summary.png
+metrics.json
+"""
 from __future__ import annotations
-
-import inspect
-import json
-import logging
-import warnings
+import inspect, json, logging, warnings
 from pathlib import Path
 from typing import Literal, Sequence, Union
 
-import joblib
+import joblib, numpy as np, pandas as pd, matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
 import shap
+from tqdm.auto import tqdm
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, RobustScaler
-from tqdm.auto import tqdm
 from xgboost import XGBRegressor
 from xgboost.callback import EarlyStopping
 
-# ────────────────────────── logging ─────────────────────────────────────────
-log = logging.getLogger(__name__)
+# ────────────────────────── logging ────────────────────────────────────── #
+log = logging.getLogger("prepare_tree")
 log.setLevel(logging.INFO)
 log.addHandler(logging.StreamHandler())
 
-
-# ─────────────────────── helper-функції ─────────────────────────────────────
-def _winsorize_iqr(df: pd.DataFrame, cols: Sequence[str]) -> pd.DataFrame:
-    """Обрізає викиди за правилом 1.5 · IQR (in-place, повертає df для chain)."""
+# ───────────────────── helper-utilities ─────────────────────────────────── #
+def _winsorize_iqr(df: pd.DataFrame, cols: Sequence[str]) -> None:
+    """In-place 1.5 · IQR clipping."""
     for c in cols:
-        q1, q3 = df[c].quantile([0.25, 0.75])
+        q1, q3 = df[c].quantile([.25, .75])
         iqr = q3 - q1
-        lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
-        df[c] = df[c].clip(lo, hi)
-    return df
+        df[c] = df[c].clip(q1 - 1.5 * iqr, q3 + 1.5 * iqr)
 
-
-def _xgb_gain_importance(model: XGBRegressor, feat_names: list[str]) -> np.ndarray:
-    """Gain-based importance, впорядкована як feat_names."""
+def _xgb_gain_importance(model: XGBRegressor, names: list[str]) -> np.ndarray:
     gain = model.get_booster().get_score(importance_type="gain")
+    if set(gain) <= set(names):                       # нові XGB
+        return np.array([gain.get(f, 0.) for f in names])
+    return np.array([gain.get(f"f{i}", 0.) for i in range(len(names))])
 
-    # ① нові XGBoost повертають справжні назви ознак
-    if set(gain) <= set(feat_names):
-        return np.array([gain.get(f, 0.0) for f in feat_names])
-
-    # ② старі – 'f0','f1',…
-    return np.array([gain.get(f"f{i}", 0.0) for i in range(len(feat_names))])
-
-
-# ────────────────────────── main pipeline ───────────────────────────────────
+# ─────────────────────────── PIPELINE ───────────────────────────────────── #
 def prepare_tree_data_for_xgb(
     raw_csv: Union[str, Path],
     *,
     target_col: str = "inflation_index_t+1",
     drop_cols: Sequence[str] = ("date", "quarter_period"),
-    out_dir: Union[str, Path] = (
-        "train_results/tree_ready_preprocessing/rf_xgb_dataset"
-    ),
-    test_frac: float = 0.20,
-    n_splits: int = 5,
+    out_dir: Union[str, Path] = "train_results/tree_run",
+    test_frac: float = .20,
+    n_splits: int = 4,
     cv_mode: Literal["ts", "expanding"] = "ts",
     rf_params: dict | None = None,
     xgb_params: dict | None = None,
     random_state: int = 42,
-    early_stopping_rounds: int = 50,
+    early_stopping_rounds: int = 40,
 ) -> None:
-    """
-    Повний цикл: препроцесинг → CV → тренування RF / XGB → SHAP → метрики.
-    """
-    raw_csv, out_dir = Path(raw_csv), Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(out_dir)
+    (out_dir / "dataset_ready").mkdir(parents=True, exist_ok=True)
     ds_dir = out_dir / "dataset_ready"
-    ds_dir.mkdir(exist_ok=True)
 
-    # ──────────────── 0. LOAD ──────────────────────────────────────────────
+    # 0 ── LOAD ──────────────────────────────────────────────────────────── #
     df = pd.read_csv(raw_csv, parse_dates=["date_q"], index_col="date_q")
     X_full = df.drop(columns=[target_col, *drop_cols])
     y_full = df[target_col]
 
-    # ──────────────── 1. TRAIN / TEST SPLIT ───────────────────────────────
-    test_size = int(np.ceil(len(df) * test_frac))
+    # 1 ── TRAIN / TEST split ────────────────────────────────────────────── #
+    test_size = max(1, int(np.ceil(len(df) * test_frac)))
     X_train, X_test = X_full.iloc[:-test_size].copy(), X_full.iloc[-test_size:].copy()
     y_train, y_test = y_full.iloc[:-test_size], y_full.iloc[-test_size:]
 
-    # ──────────────── 2. IMPUTATION + WINSORIZE ───────────────────────────
-    num_cols = X_train.select_dtypes(include=np.number).columns.tolist()
+    # 2 ── IMPUTE + WINSORIZE ────────────────────────────────────────────── #
+    num_cols = X_train.select_dtypes(np.number).columns.tolist()
     cat_cols = X_train.select_dtypes(exclude=np.number).columns.tolist()
 
-    medians = X_train[num_cols].median()
-    modes = X_train[cat_cols].agg(
-        lambda s: s.mode().iat[0] if not s.mode().empty else "missing"
-    )
-    # заповнюємо пропуски
-    X_train[num_cols] = X_train[num_cols].fillna(medians)
-    X_test[num_cols] = X_test[num_cols].fillna(medians)
-    X_train[cat_cols] = X_train[cat_cols].fillna(modes)
-    X_test[cat_cols] = X_test[cat_cols].fillna(modes)
+    med = X_train[num_cols].median()
+    if cat_cols:
+        mode = X_train[cat_cols].agg(lambda s: s.mode().iloc[0] if not s.mode().empty else "missing")
 
-    # winsorize
+    for D in (X_train, X_test):
+        D[num_cols] = D[num_cols].fillna(med)
+        if cat_cols:
+            D[cat_cols] = D[cat_cols].fillna(mode)
+
     _winsorize_iqr(X_train, num_cols)
-    _winsorize_iqr(X_test, num_cols)
+    _winsorize_iqr(X_test,  num_cols)
 
-    # ──────────────── 3. SAVE RAW DATASETS ────────────────────────────────
+    # save raw splits
     X_train.to_csv(ds_dir / "X_train_raw.csv")
     X_test.to_csv(ds_dir / "X_test_raw.csv")
     y_train.to_csv(ds_dir / "y_train.csv")
     y_test.to_csv(ds_dir / "y_test.csv")
 
-    # ──────────────── 4. PREPROCESSOR ─────────────────────────────────────
-    num_pipe = Pipeline([("scale", RobustScaler())])
-    cat_pipe = Pipeline(
-        [("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=False))]
-    )
+    # 3 ── PREPROCESSOR  (scale + OHE) ───────────────────────────────────── #
     prep = ColumnTransformer(
-        [("num", num_pipe, num_cols), ("cat", cat_pipe, cat_cols)],
+        [
+            ("num", Pipeline([("sc", RobustScaler())]), num_cols),
+            ("cat", Pipeline(
+                [("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=False))]
+            ), cat_cols),
+        ],
         remainder="drop",
     ).set_output(transform="pandas")
 
-    # ──────────────── 5. МОДЕЛІ ───────────────────────────────────────────
-    rf_defaults = dict(
-        n_estimators=300,
-        max_depth=None,
-        max_features="sqrt",
-        min_samples_leaf=5,
-        n_jobs=-1,
-        random_state=random_state,
-    )
-    xgb_defaults = dict(
-        n_estimators=2_000,          # верхня межа: зупиниться раніше
-        learning_rate=0.02,
-        max_depth=6,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=1.0,
-        reg_lambda=2.0,
+    # 💡  Зберігаємо трансформер одразу (для Hansen-моделі та репро)
+
+    # 4 ── MODELS  + дефолти ─────────────────────────────────────────────── #
+    rf_def = dict(n_estimators=300, max_depth=None, max_features="sqrt",
+                  min_samples_leaf=5, n_jobs=-1, random_state=random_state)
+    xgb_def = dict(
+        n_estimators=2_000, learning_rate=.02,
+        max_depth=4, min_child_weight=2,
+        subsample=.7, colsample_bytree=.8, gamma=.1,
+        reg_alpha=1., reg_lambda=2.,
         objective="reg:squarederror",
-        n_jobs=-1,
-        random_state=random_state,
+        n_jobs=-1, random_state=random_state,
     )
 
     models = {
-        "RF": RandomForestRegressor(**(rf_params or rf_defaults)),
-        "XGB": XGBRegressor(**(xgb_params or xgb_defaults)),
+        "RF": RandomForestRegressor(**(rf_params or rf_def)),
+        "XGB": XGBRegressor(**(xgb_params or xgb_def)),
     }
 
-    # ──────────────── 6. CROSS-VALIDATION ─────────────────────────────────
+    # 5 ── CV SPLITS ------------------------------------------------------- #
     if cv_mode == "expanding":
-        # простий expanding window
-        horizon = len(X_train) // (n_splits + 1)
-        splits = [
-            (np.arange(0, k * horizon), np.arange(k * horizon, (k + 1) * horizon))
-            for k in range(1, n_splits + 1)
-        ]
-    else:  # default "ts"
-        tscv = TimeSeriesSplit(n_splits=n_splits)
-        splits = list(tscv.split(X_train))
+        h = len(X_train) // (n_splits + 1)
+        splits = [(np.arange(0, k*h), np.arange(k*h, (k+1)*h)) for k in range(1, n_splits+1)]
+    else:
+        splits = list(TimeSeriesSplit(n_splits=n_splits).split(X_train))
 
     metrics: dict[str, dict] = {}
 
+    # 6 ── LOOP over models ------------------------------------------------ #
     for name, est in models.items():
         pipe = Pipeline([("prep", prep), ("model", est)])
-        mae_f, rmse_f, mape_f = [], [], []
 
-        for fold, (tr_idx, val_idx) in enumerate(tqdm(splits, desc=name), 1):
-            X_tr, y_tr = X_train.iloc[tr_idx], y_train.iloc[tr_idx]
-            X_val, y_val = X_train.iloc[val_idx], y_train.iloc[val_idx]
+        cv_mae, cv_rmse, cv_mape = [], [], []
+        for tr, vl in tqdm(splits, desc=f"CV-{name}"):
+            X_tr, y_tr = X_train.iloc[tr], y_train.iloc[tr]
+            X_vl, y_vl = X_train.iloc[vl], y_train.iloc[vl]
 
             pipe.fit(X_tr, y_tr)
-            pred = pipe.predict(X_val)
+            pr = pipe.predict(X_vl)
 
-            mae_f.append(mean_absolute_error(y_val, pred))
+            cv_mae.append(mean_absolute_error(y_vl, pr))
+            cv_rmse.append(np.sqrt(mean_squared_error(y_vl, pr)))
+            cv_mape.append(np.mean(np.abs((y_vl - pr) / y_vl))*100)
 
-            # підтримуємо старі версії sklearn (<0.22)
-            try:
-                rmse_val = mean_squared_error(y_val, pred, squared=False)
-            except TypeError:
-                rmse_val = np.sqrt(mean_squared_error(y_val, pred))
-            rmse_f.append(rmse_val)
+        metrics[name] = {"cv": {
+            "MAE": float(np.mean(cv_mae)),
+            "RMSE": float(np.mean(cv_rmse)),
+            "MAPE": float(np.mean(cv_mape)),
+        }}
+        log.info("%s  CV-MAE %.4f  RMSE %.4f  MAPE %.2f%%",
+                 name, *metrics[name]["cv"].values())
 
-            mape_f.append(np.mean(np.abs((y_val - pred) / y_val)) * 100)
-
-        metrics[name] = {
-            "cv": {
-                "MAE": float(np.mean(mae_f)),
-                "RMSE": float(np.mean(rmse_f)),
-                "MAPE": float(np.mean(mape_f)),
-            }
-        }
-        log.info(
-            "%s  CV  MAE %.4f  RMSE %.4f  MAPE %.2f%%",
-            name,
-            metrics[name]["cv"]["MAE"],
-            metrics[name]["cv"]["RMSE"],
-            metrics[name]["cv"]["MAPE"],
-        )
-
-        # ─────── 7. FINAL TRAIN НА ВСЬОМУ TRAIN ───────────────────────────
-        # ─── блок FINAL-TRAIN для XGB замінити повністю
-        # 7. FINAL TRAIN ON FULL TRAIN --------------------------------------------
+        # 7 ── FINAL FIT  (early-stop для XGB) ----------------------------- #
         if name == "XGB":
-            prep.fit(X_train)
-            X_test_prep = prep.transform(X_test)
+            prep.fit(X_train); X_test_p = prep.transform(X_test)
+            joblib.dump(prep, out_dir / "prep.pkl")
 
-            fit_kwargs: dict = {
-                "model__eval_set": [(X_test_prep, y_test)],
-                "model__verbose": False,
-            }
-
-            sig = inspect.signature(XGBRegressor.fit).parameters
-
-            if "early_stopping_rounds" in sig:
-                # ≥ 1.7  (full build)  – усе ок
-                fit_kwargs["model__early_stopping_rounds"] = early_stopping_rounds
-
-            elif "callbacks" in sig:
-                # ≈ 1.3 – 1.6 – працює через callbacks
-                fit_kwargs["model__callbacks"] = [
-                    EarlyStopping(
-                        rounds=early_stopping_rounds,
-                        save_best=True,
-                        data_name="validation_0",
-                        metric_name="rmse",
-                    )
-                ]
-
-            else:
-                # 0.9 – 1.2 – ні того, ні того → тренуємо без ES
-                warnings.warn(
-                    "XGBoost < 1.3 detected – early-stopping недоступний; "
-                    "модель тренується на повній кількості trees",
-                    RuntimeWarning,
-                )
-
-            pipe.fit(X_train, y_train, **fit_kwargs)
-
+            fit_kw = {"model__eval_set": [(X_test_p, y_test)], "model__verbose": 0}
+            if "early_stopping_rounds" in inspect.signature(XGBRegressor.fit).parameters:
+                fit_kw["model__early_stopping_rounds"] = early_stopping_rounds
+            elif "callbacks" in inspect.signature(XGBRegressor.fit).parameters:
+                fit_kw["model__callbacks"] = [EarlyStopping(rounds=early_stopping_rounds, save_best=True)]
+            pipe.fit(X_train, y_train, **fit_kw)
         else:
             pipe.fit(X_train, y_train)
 
-        # ─────── hold-out metrics
+        # 8 ── TEST metrics + save model ---------------------------------- #
         y_pred = pipe.predict(X_test)
-        try:
-            rmse_test = mean_squared_error(y_test, y_pred, squared=False)
-        except TypeError:
-            rmse_test = np.sqrt(mean_squared_error(y_test, y_pred))
-
         metrics[name]["test"] = {
             "MAE": float(mean_absolute_error(y_test, y_pred)),
-            "RMSE": float(rmse_test),
-            "MAPE": float(np.mean(np.abs((y_test - y_pred) / y_test)) * 100),
+            "RMSE": float(np.sqrt(mean_squared_error(y_test, y_pred))),
+            "MAPE": float(np.mean(np.abs((y_test - y_pred) / y_test))*100),
         }
-
-        # ─────── save model
         joblib.dump(pipe, out_dir / f"{name.lower()}_model.pkl")
 
-        # ─────── feature importance
-        fi = (
-            pipe["model"].feature_importances_
-            if name == "RF"
-            else _xgb_gain_importance(
-                pipe["model"], pipe["prep"].get_feature_names_out()
-            )
-        )
-        (
-            pd.Series(fi, index=pipe["prep"].get_feature_names_out())
-            .sort_values(ascending=False)
-            .to_csv(out_dir / f"{name.lower()}_feat_imp.csv")
-        )
+        # feature importance
+        fi = (pipe["model"].feature_importances_
+              if name == "RF"
+              else _xgb_gain_importance(pipe["model"], pipe["prep"].get_feature_names_out()))
+        pd.Series(fi, index=pipe["prep"].get_feature_names_out())\
+          .sort_values(ascending=False)\
+          .to_csv(out_dir / f"{name.lower()}_feat_imp.csv")
 
-        # ─────── SHAP для XGB
+        # SHAP для XGB
         if name == "XGB":
-            log.info("Computing SHAP values …")
-            explainer = shap.TreeExplainer(pipe["model"])
-            X_tr_prep = pipe["prep"].transform(X_train)
-            shap_vals = explainer.shap_values(X_tr_prep)
-
+            log.info("…computing SHAP")
+            expl = shap.TreeExplainer(pipe["model"])
+            sv   = expl.shap_values(prep.transform(X_train))
             shap.summary_plot(
-                shap_vals,
-                X_tr_prep,
-                feature_names=pipe["prep"].get_feature_names_out(),
-                show=False,
-            )
-            plt.gcf().set_size_inches(9, 6)
-            plt.tight_layout()
-            plt.savefig(out_dir / "xgb_shap_summary.png", dpi=300)
-            plt.close()
+                sv, prep.transform(X_train),
+                feature_names=prep.get_feature_names_out(),
+                show=False)
+            plt.gcf().set_size_inches(9,6); plt.tight_layout()
+            plt.savefig(out_dir / "xgb_shap_summary.png", dpi=300); plt.close()
 
-    # ──────────────── 8. SAVE METRICS ─────────────────────────────────────
-    with open(out_dir / "metrics.json", "w") as fp:
-        json.dump(metrics, fp, indent=2)
+    # 9 ── SAVE metrics ---------------------------------------------------- #
+    json.dump(metrics, open(out_dir / "metrics.json", "w"), indent=2)
 
-    # pretty print
     log.info("======== FINAL METRICS ========")
     for m, res in metrics.items():
-        log.info(
-            "%s  CV  MAE %.4f  RMSE %.4f  MAPE %.2f%% | "
-            "TEST  MAE %.4f  RMSE %.4f  MAPE %.2f%%",
-            m,
-            res["cv"]["MAE"],
-            res["cv"]["RMSE"],
-            res["cv"]["MAPE"],
-            res["test"]["MAE"],
-            res["test"]["RMSE"],
-            res["test"]["MAPE"],
-        )
-    log.info("✓  Done.  Artifacts saved to %s", out_dir)
+        log.info("%s  CV-MAE %.4f | TEST-MAE %.4f  RMSE %.4f  MAPE %.2f%%",
+                 m, res['cv']['MAE'], res['test']['MAE'],
+                 res['test']['RMSE'], res['test']['MAPE'])
+    log.info("✓  Done.  All artifacts → %s", out_dir.resolve())
+
+
+# ─────────────────────────── CLI entry ─────────────────────────────────── #
+if __name__ == "__main__":
+    import argparse
+    cli = argparse.ArgumentParser("Train RF & XGB on quarterly dataset")
+    cli.add_argument("csv", help="src/…/quarterly_data_with_features.csv")
+    cli.add_argument("--out-dir", default="train_results/tree_run")
+    cli.add_argument("--cv", choices=["ts", "expanding"], default="ts")
+    cli.add_argument("--early-stop", type=int, default=40)
+    args = cli.parse_args()
+
+    prepare_tree_data_for_xgb(
+        args.csv,
+        out_dir=args.out_dir,
+        cv_mode=args.cv,
+        early_stopping_rounds=args.early_stop,
+    )

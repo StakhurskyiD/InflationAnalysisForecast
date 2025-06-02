@@ -1,0 +1,7 @@
+{
+  "gamma_hat": -0.7269721260703331,
+  "p_value": 0.0,
+  "th_var": "num__inflation_gap",
+  "boot_rep": 1000,
+  "extra_reg": []
+}
