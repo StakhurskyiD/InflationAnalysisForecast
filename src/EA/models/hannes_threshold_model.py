@@ -45,22 +45,24 @@ def run_hansen(raw_csv: Path, prep_pkl: Path, *,
     # grid 5-95 percentiles (500 knots)
     grid = np.quantile(Z, np.linspace(.05, .95, 500))
 
-    def rss_gamma(g):
+    def rss_gamma(g, y_vec):
+        """Residual sum of squares for a given threshold and response."""
         R = (Z > g).astype(float)
-        return sm.OLS(y, sm.add_constant(np.c_[X_base, R])).fit(
+        return sm.OLS(y_vec, sm.add_constant(np.c_[X_base, R])).fit(
                      cov_type="HAC", cov_kwds={"maxlags":4}).ssr
 
-    rss        = np.array([rss_gamma(g) for g in grid])
+    rss        = np.array([rss_gamma(g, y) for g in grid])
     gamma_hat  = float(grid[np.argmin(rss)])
 
     # ----- parallel wild-bootstrap --------------------------------------
     from joblib import Parallel, delayed
     rng = np.random.default_rng(42)
 
-    def one_rep(seed):
-        ν  = rng.integers(0, 2, size=len(y))*2 - 1         # ±1
+    def one_rep(seed: int):
+        rng = np.random.default_rng(seed)
+        ν  = rng.integers(0, 2, size=len(y)) * 2 - 1       # ±1
         y_star = y + ν * (y - y.mean())                    # wild
-        rss_star = [rss_gamma(g) for g in grid]
+        rss_star = [rss_gamma(g, y_star) for g in grid]
         return min(rss_star) - rss_star[np.argmin(rss)]
 
     supW_obs = min(rss) - rss[np.argmin(rss)]
